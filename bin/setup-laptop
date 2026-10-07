@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Laptop (daily driver) setup. Safe to re-run, e.g. after the delegate's IP changes.
+#   bin/setup-laptop <delegate-ip> <delegate-user> [project-dir-on-delegate, relative to its home]
+#   bin/setup-laptop 10.0.0.66 ryan IdeaProjects/local-delegate
+#
+# What it does:
+#   1. ~/.ssh/config "delegate" alias pinned to the IPv4 address (avoids flaky IPv6 link-local on .local names)
+#   2. checks key-based SSH login
+#   3. installs dlg / dlg-db to ~/.local/bin and the /delegate, /plan-work commands to ~/.claude/commands
+#   4. installs a launchd SSH tunnel: localhost:7420 → delegate:127.0.0.1:7420
+#      (sidesteps macOS Local Network privacy, which blocks the claude binary from LAN addresses)
+#   5. registers the MCP server at user scope with the token fetched over SSH
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REPO_DIR=$PWD
+
+IP=${1:-}; RUSER=${2:-}; RDIR=${3:-IdeaProjects/local-delegate}
+PORT=${DELEGATE_PORT:-7420}
+HOST_ALIAS=delegate
+TUNNEL_LABEL=local.delegate.tunnel
+
+say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m!!  %s\033[0m\n' "$*"; }
+die()  { printf '\033[31mxx  %s\033[0m\n' "$*" >&2; exit 1; }
+
+[[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && -n "$RUSER" ]] \
+  || die "usage: bin/setup-laptop <delegate-ipv4> <delegate-user> [project-dir-on-delegate]"
+[[ "$(uname -s)" == "Darwin" ]] || warn "not macOS — launchd steps will fail"
+
+# ---------------------------------------------------------------- 1. SSH alias
+say "SSH alias '$HOST_ALIAS' → $RUSER@$IP"
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+[[ -f ~/.ssh/id_ed25519 ]] || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+touch ~/.ssh/config && chmod 600 ~/.ssh/config
+if grep -qE "^Host[[:space:]]+$HOST_ALIAS[[:space:]]*$" ~/.ssh/config; then
+  IP="$IP" RUSER="$RUSER" perl -0 -i -pe '
+    s{(^Host[ \t]+delegate[ \t]*\n(?:[ \t]+.*\n)*?)[ \t]+HostName[ \t]+\S+}{$1  HostName $ENV{IP}}m;
+    s{(^Host[ \t]+delegate[ \t]*\n(?:[ \t]+.*\n)*?)[ \t]+User[ \t]+\S+}{$1  User $ENV{RUSER}}m;
+  ' ~/.ssh/config
+  grep -A8 -E "^Host[[:space:]]+$HOST_ALIAS" ~/.ssh/config | grep -q 'AddressFamily' \
+    || perl -0 -i -pe 's{(^Host[ \t]+delegate[ \t]*\n)}{$1  AddressFamily inet\n}m' ~/.ssh/config
+  echo "    updated existing entry"
+else
+  cat >> ~/.ssh/config <<EOF
+
+Host $HOST_ALIAS
+  HostName $IP
+  User $RUSER
+  AddressFamily inet
+  IdentityFile ~/.ssh/id_ed25519
+  AddKeysToAgent yes
+  UseKeychain yes
+  ServerAliveInterval 30
+EOF
+  echo "    added entry"
+fi
+
+# ---------------------------------------------------------------- 2. key login
+say "Checking key-based SSH login"
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST_ALIAS" true 2>/dev/null; then
+  cat >&2 <<EOF
+xx  Key login to $HOST_ALIAS failed. Fix it, then re-run this script:
+    - On the delegate: Remote Login on (System Settings → General → Sharing), and the machine awake.
+    - Install your key:   ssh-copy-id $HOST_ALIAS
+      (if the delegate already has password logins disabled, re-enable them briefly:
+       sudo rm /etc/ssh/sshd_config.d/100-keys-only.conf)
+EOF
+  exit 1
+fi
+echo "    ok"
+ssh -o BatchMode=yes "$HOST_ALIAS" "test -f ~/$RDIR/.env" \
+  || die "no ~/$RDIR/.env on the delegate — run bin/bootstrap there first, or pass the project dir as the 3rd argument"
+
+# ---------------------------------------------------------------- 3. tools + commands
+say "Installing dlg, dlg-db, and Claude Code commands"
+mkdir -p ~/.local/bin ~/.claude/commands
+install -m 755 "$REPO_DIR/bin/dlg" "$REPO_DIR/bin/dlg-db" ~/.local/bin/
+install -m 644 "$REPO_DIR/claude/commands/delegate.md" "$REPO_DIR/claude/commands/plan-work.md" ~/.claude/commands/
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "~/.local/bin is not on PATH: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;; esac
+
+# ---------------------------------------------------------------- 4. SSH tunnel
+say "Installing SSH tunnel localhost:$PORT → $HOST_ALIAS:127.0.0.1:$PORT"
+PLIST=~/Library/LaunchAgents/$TUNNEL_LABEL.plist
+mkdir -p ~/Library/LaunchAgents
+cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$TUNNEL_LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/ssh</string><string>-N</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-o</string><string>ServerAliveInterval=30</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-L</string><string>$PORT:127.0.0.1:$PORT</string>
+    <string>$HOST_ALIAS</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>/tmp/delegate-tunnel.log</string>
+</dict></plist>
+EOF
+launchctl bootout "gui/$(id -u)/$TUNNEL_LABEL" 2>/dev/null || true
+sleep 1
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+for _ in $(seq 1 15); do curl -fsS --max-time 1 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && break; sleep 1; done
+HEALTH=$(curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null) \
+  || die "tunnel up but daemon not answering — check /tmp/delegate-tunnel.log here and ~/delegate/daemon.log on the delegate"
+echo "    $HEALTH"
+
+# ---------------------------------------------------------------- 5. MCP registration
+say "Registering MCP server 'delegate' (user scope)"
+TOKEN=$(ssh -o BatchMode=yes "$HOST_ALIAS" "grep '^DELEGATE_TOKEN=' ~/$RDIR/.env | cut -d= -f2")
+[[ ${#TOKEN} -ge 32 ]] || die "couldn't read DELEGATE_TOKEN from ~/$RDIR/.env on the delegate"
+if command -v claude >/dev/null; then
+  claude mcp remove delegate -s user >/dev/null 2>&1 || true
+  claude mcp add --scope user --transport http delegate "http://127.0.0.1:$PORT/mcp" \
+    --header "Authorization: Bearer $TOKEN" >/dev/null
+  claude mcp list 2>/dev/null | grep -E '^delegate:' || warn "run 'claude mcp list' to check the connection"
+else
+  warn "claude CLI not found; register manually:"
+  echo "    claude mcp add --scope user --transport http delegate http://127.0.0.1:$PORT/mcp --header \"Authorization: Bearer <token>\""
+fi
+
+cat <<EOF
+
+$(say "Done.")
+  In each repo you want to delegate from:   dlg link <repo-name> $HOST_ALIAS
+  Then, in Claude Code (restart open sessions):   /plan-work <feature>
+  Watch the local model live:   dlg watch
+EOF

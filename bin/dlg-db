@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Copy a consistent, read-only snapshot of the delegate's task database to the laptop,
+# e.g. for IntelliJ/DataGrip. Never touches the live database's locks.
+#   dlg-db                         → ~/delegate-db/delegate.db
+#   DLG_DB_DIR=~/somewhere dlg-db
+set -euo pipefail
+HOST=${DLG_HOST:-delegate}
+DEST_DIR=${DLG_DB_DIR:-$HOME/delegate-db}
+mkdir -p "$DEST_DIR"
+ssh -n "$HOST" "sqlite3 ~/delegate/delegate.db \".backup '/tmp/delegate-snapshot.db'\""
+scp -q "$HOST:/tmp/delegate-snapshot.db" "$DEST_DIR/.delegate.db.tmp"
+mv "$DEST_DIR/.delegate.db.tmp" "$DEST_DIR/delegate.db"
+echo "snapshot updated: $(date +%T) → $DEST_DIR/delegate.db"

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# One-shot setup for the delegate machine (macOS, Apple Silicon). Safe to re-run.
+#   bin/setup-delegate               install deps, build, write .env, probe the model server, install launchd agent
+#   bin/setup-delegate --no-launchd  same, but don't install/restart the launchd agent
+# Usually run via bin/bootstrap, which installs Ollama and the model first.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+PROJECT_DIR=$PWD
+LABEL=local.delegate.daemon
+INSTALL_LAUNCHD=1
+[[ "${1:-}" == "--no-launchd" ]] && INSTALL_LAUNCHD=0
+
+say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m!!  %s\033[0m\n' "$*"; }
+die()  { printf '\033[31mxx  %s\033[0m\n' "$*" >&2; exit 1; }
+
+get_env() { grep -E "^$1=" .env | tail -1 | cut -d= -f2- || true; }
+set_env() {
+  if grep -qE "^#? *$1=" .env; then K="$1" V="$2" perl -i -pe 's/^#? *\Q$ENV{K}\E=.*/$ENV{K}=$ENV{V}/' .env
+  else printf '%s=%s\n' "$1" "$2" >> .env; fi
+}
+
+# ---------------------------------------------------------------- prerequisites
+say "Checking prerequisites"
+[[ "$(uname -s)" == "Darwin" ]] || warn "not macOS — launchd steps will be skipped"
+command -v git  >/dev/null || die "git not found (xcode-select --install)"
+command -v node >/dev/null || die "node not found (need 22+): brew install node"
+NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
+(( NODE_MAJOR >= 22 )) || die "node $NODE_MAJOR found; need 22+"
+echo "    node $(node --version) at $(command -v node)"
+
+# ---------------------------------------------------------------- build
+say "Installing dependencies and building"
+if [[ -f package-lock.json ]]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+npm run build
+
+# ---------------------------------------------------------------- .env
+if [[ ! -f .env ]]; then
+  say "Creating .env"
+  cp .env.example .env
+fi
+chmod 600 .env
+
+[[ -n "$(get_env DELEGATE_TOKEN)" ]] || { set_env DELEGATE_TOKEN "$(openssl rand -hex 32)"; echo "    generated DELEGATE_TOKEN"; }
+
+case "$(get_env DELEGATE_HOST)" in
+  127.0.0.1|localhost|'') ;;
+  *) warn "DELEGATE_HOST=$(get_env DELEGATE_HOST) exposes the daemon on the network. The laptop reaches it through an SSH tunnel, so 127.0.0.1 is enough and safer." ;;
+esac
+
+# launchd gets a minimal PATH; pin the toolchain this shell can see (node, pnpm, cargo, …).
+set_env NODE_BIN "'$(command -v node)'"
+set_env DELEGATE_PATH "'$PATH'"
+echo "    pinned NODE_BIN and DELEGATE_PATH from this shell"
+
+mkdir -p "$HOME/delegate/repos" "$HOME/delegate/worktrees" "$HOME/delegate/logs"
+
+# ---------------------------------------------------------------- model server
+BASE=$(get_env MODEL_BASE_URL); MODEL=$(get_env MODEL_NAME)
+say "Probing model server at $BASE"
+if MODELS_JSON=$(curl -fsS --max-time 5 "$BASE/models" 2>/dev/null); then
+  IDS=$(printf '%s' "$MODELS_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{for(const m of JSON.parse(s).data??[])console.log(m.id)}catch{}})')
+  echo "    models served:"; printf '%s\n' "$IDS" | sed 's/^/      - /'
+  if ! printf '%s\n' "$IDS" | grep -qxF "$MODEL"; then
+    warn "MODEL_NAME=$MODEL is not in that list. Set MODEL_NAME in .env to the exact id above."
+  else
+    echo "    checking tool calling (a thinking model may take a minute)…"
+    REQ=$(node -e 'console.log(JSON.stringify({model:process.argv[1],max_tokens:16384,messages:[{role:"user",content:"Call the list_files tool."}],tools:[{type:"function",function:{name:"list_files",description:"List files",parameters:{type:"object",properties:{}}}}]}))' "$MODEL")
+    if RESP=$(curl -fsS --max-time 300 "$BASE/chat/completions" -H 'content-type: application/json' -d "$REQ" 2>/dev/null) \
+       && printf '%s' "$RESP" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.exit(JSON.parse(s).choices?.[0]?.message?.tool_calls?.length?0:1))'; then
+      echo "    tool calling OK"
+    else
+      warn "no tool_calls in the response — the daemon needs a server/chat template that emits OpenAI tool_calls for this model."
+    fi
+  fi
+else
+  warn "model server not reachable at $BASE. Start it (Ollama: open the app, then ollama pull $MODEL) and re-run with --no-launchd to re-probe."
+fi
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  WIRED=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+  [[ "$WIRED" == "0" ]] && warn "GPU wired limit is the macOS default. Only builds over ~90GB (e.g. q4_K_M) need: sudo sysctl iogpu.wired_limit_mb=118000 (resets on reboot)"
+  pmset -g 2>/dev/null | grep -qiE 'sleepdisabled[[:space:]]+1' \
+    || warn "This machine can sleep. A sleeping delegate drops connections: sudo pmset -a disablesleep 1 (keep it on a desk, plugged in)"
+fi
+
+# ---------------------------------------------------------------- launchd
+PORT=$(get_env DELEGATE_PORT); PORT=${PORT:-7420}
+if (( INSTALL_LAUNCHD )) && [[ "$(uname -s)" == "Darwin" ]]; then
+  say "Installing launchd agent ($LABEL)"
+  DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  sed -e "s#__PROJECT_DIR__#$PROJECT_DIR#g" -e "s#__HOME__#$HOME#g" "launchd/$LABEL.plist" > "$DEST"
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$DEST"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do curl -fsS --max-time 1 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && break; sleep 1; done
+  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    echo "    daemon healthy at http://127.0.0.1:$PORT"
+  else
+    warn "daemon not answering yet — check $HOME/delegate/daemon.log"
+  fi
+fi
+
+# ---------------------------------------------------------------- next steps
+LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "<this-machine-ip>")
+REL_DIR=${PROJECT_DIR#"$HOME"/}
+cat <<EOF
+
+$(say "Done. Next:")
+  On this machine:
+    - System Settings → General → Sharing → Remote Login: on, "Only these users: $(whoami)"
+    - Reserve $LAN_IP for this machine in your router (DHCP reservation)
+  On the laptop, from a checkout of this repo:
+    bin/setup-laptop $LAN_IP $(whoami) $REL_DIR
+EOF

@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# dlg — laptop-side helper for the local delegate.
+#
+# All delegate traffic goes to a private bare repo on the delegate machine (git remote "delegate").
+# Delegate branches live only under refs/heads/dlg/* on that remote and refs/remotes/delegate/dlg/*
+# locally — no local dlg/* branches exist, so `git push origin` can't carry them to GitHub.
+set -euo pipefail
+
+REMOTE=delegate
+HOOK_MARKER='# dlg-guard'
+
+die() { echo "dlg: $*" >&2; exit 1; }
+need_repo() { git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"; }
+need_remote() { git remote get-url "$REMOTE" >/dev/null 2>&1 || die "no '$REMOTE' remote; run: dlg link <repo-name> <ssh-host>"; }
+need_slug() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{1,63}$ ]] || die "slug must match ^[a-z0-9][a-z0-9-]{1,63}$"; }
+remote_ref_exists() { git ls-remote --exit-code --heads "$REMOTE" "$1" >/dev/null 2>&1; }
+
+install_guard() {
+  local hooks_path hook
+  hooks_path=$(git config --get core.hooksPath || true)
+  if [[ -n "$hooks_path" ]]; then
+    echo "dlg: core.hooksPath is set ($hooks_path) — not touching shared hooks."
+    echo "     You're still protected: dlg never creates local dlg/* branches."
+    return
+  fi
+  hook="$(git rev-parse --git-path hooks)/pre-push"
+  if [[ -f "$hook" ]] && ! grep -q "$HOOK_MARKER" "$hook"; then
+    echo "dlg: existing pre-push hook found; add this guard to it manually:"
+    guard_body
+    return
+  fi
+  { echo '#!/usr/bin/env bash'; guard_body; echo 'exit 0'; } > "$hook"
+  chmod +x "$hook"
+  echo "dlg: installed pre-push guard at $hook"
+}
+
+guard_body() {
+  cat <<EOF
+$HOOK_MARKER: never send delegate refs anywhere but the '$REMOTE' remote
+if [ "\$1" != "$REMOTE" ]; then
+  while read -r _lref _lsha rref _rsha; do
+    case "\$rref" in
+      refs/heads/dlg/*|refs/remotes/$REMOTE/*)
+        echo "pre-push: refusing to push delegate ref \$rref to '\$1'" >&2; exit 1 ;;
+    esac
+  done
+fi
+EOF
+}
+
+cmd_link() {
+  local name=${1:-} host=${2:-} dir=${3:-delegate/repos}
+  [[ -n "$name" && -n "$host" ]] || die "usage: dlg link <repo-name> <ssh-host> [remote-dir=delegate/repos]"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "repo name may only contain letters, digits, . _ -"
+  need_repo
+  # shellcheck disable=SC2029 # expand locally on purpose
+  ssh -n "$host" "mkdir -p ~/$dir && { [ -f ~/$dir/$name.git/HEAD ] || git init --bare --quiet ~/$dir/$name.git </dev/null >/dev/null 2>&1; }"
+  local url="$host:$dir/$name.git"
+  if git remote get-url "$REMOTE" >/dev/null 2>&1; then git remote set-url "$REMOTE" "$url"; else git remote add "$REMOTE" "$url"; fi
+  git config --replace-all "remote.$REMOTE.fetch" "+refs/heads/dlg/*:refs/remotes/$REMOTE/dlg/*"
+  git config "remote.$REMOTE.tagOpt" --no-tags
+  install_guard
+  echo "dlg: linked '$name' → $url"
+}
+
+cmd_base() {
+  local slug=${1:-}; need_slug "$slug"; need_repo; need_remote
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "dlg: warning — uncommitted changes are NOT sent; only HEAD ($(git rev-parse --short HEAD)) is." >&2
+  fi
+  remote_ref_exists "dlg/$slug/base" && die "dlg/$slug/base already exists on the delegate; pick a new slug or 'dlg clean $slug'"
+  git push --quiet --no-verify "$REMOTE" "HEAD:refs/heads/dlg/$slug/base"
+  echo "dlg: pushed $(git rev-parse --short HEAD) → $REMOTE dlg/$slug/base"
+}
+
+cmd_fetch() { need_repo; need_remote; git fetch --quiet --prune "$REMOTE"; }
+
+cmd_diff() {
+  local slug=${1:-}; need_slug "$slug"; shift; cmd_fetch
+  git diff "$@" "$REMOTE/dlg/$slug/base" "$REMOTE/dlg/$slug/impl"
+}
+
+cmd_log() {
+  local slug=${1:-}; need_slug "$slug"; cmd_fetch
+  git log --stat "$REMOTE/dlg/$slug/base..$REMOTE/dlg/$slug/impl"
+}
+
+cmd_squash() {
+  local slug=${1:-}; need_slug "$slug"; cmd_fetch
+  local base; base=$(git rev-parse "$REMOTE/dlg/$slug/base")
+  if [[ "$(git rev-parse HEAD)" != "$base" ]]; then
+    git merge-base --is-ancestor "$base" HEAD || die "current branch doesn't contain the task's base commit; check out the branch you delegated from"
+    echo "dlg: note — HEAD has moved past the task base; resolve any conflicts as usual." >&2
+  fi
+  git merge --squash "$REMOTE/dlg/$slug/impl"
+  echo "dlg: changes from $slug staged (not committed). Review, then commit in your own words."
+}
+
+cmd_clean() {
+  local slug=${1:-}; need_slug "$slug"; need_repo; need_remote
+  git push --quiet --no-verify "$REMOTE" --delete "dlg/$slug/base" "dlg/$slug/impl" 2>/dev/null \
+    || git push --quiet --no-verify "$REMOTE" --delete "dlg/$slug/base" 2>/dev/null || true
+  git fetch --quiet --prune "$REMOTE"
+  echo "dlg: removed $slug from the delegate"
+}
+
+cmd_watch() {
+  # Live one-line-per-event view of a task's log. No slug = the most recently active task.
+  local slug=${1:-} host=${DLG_HOST:-delegate} remote
+  if [[ -n "$slug" ]]; then
+    need_slug "$slug"
+    remote="f=~/delegate/logs/$slug.jsonl; [ -f \$f ] || { echo 'no log for $slug yet' >&2; exit 1; }; echo \"watching \$f\" >&2; tail -n 40 -F \$f"
+  else
+    remote="f=\$(ls -t ~/delegate/logs/*.jsonl 2>/dev/null | head -1); [ -n \"\$f\" ] || { echo 'no logs yet' >&2; exit 1; }; echo \"watching \$f\" >&2; tail -n 40 -F \"\$f\""
+  fi
+  if command -v jq >/dev/null; then
+    ssh "$host" "$remote" | jq --unbuffered -r '
+      def s: if . == null then "" else tostring end;
+      [ (.ts // "")[11:19], "r\(.round|s)", .type,
+        ( if .type == "assistant" then
+            "t\(.turn) \(((.toolCalls // []) | map(.name) | join(",")) as $t | if $t == "" then "(no tool)" else $t end)  in=\(.promptTokens|s) out=\(.completionTokens|s) ctx=\(.contextPct|s)% \(((.ms // 0) / 1000) | floor)s"
+          elif .type == "tool" then
+            "t\(.turn) \(.name) \((.args.path // .args.command // .args.pattern // "") | s | .[0:80])"
+          elif .type == "verify" then "attempt \(.attempt) passed=\(.passed)"
+          elif .type == "nudge" then "t\(.turn) \(.reason)"
+          elif .type == "guard" then "\(.kind): \(.message)"
+          elif .type == "start" then "\(.model|s) budget=\(.maxTurns|s)t/\(.maxMinutes|s)m"
+          elif .type == "end" then "\(.state|s) \(.failure|s) turns=\(.turns|s) out=\(.usage.completionTokens|s)"
+          else "" end ) ] | @tsv'
+  else
+    ssh "$host" "$remote"
+  fi
+}
+
+cmd_list() { need_repo; need_remote; git ls-remote --heads "$REMOTE" 'dlg/*' | awk '{print $2}' | sed 's#refs/heads/##'; }
+
+usage() {
+  cat <<'EOF'
+usage: dlg <command> [args]
+
+  link <repo-name> <ssh-host> [dir]   create the private bare repo on the delegate, add the 'delegate' remote, install the push guard
+  base <slug>                          send HEAD (spec + failing tests committed) as dlg/<slug>/base
+  fetch                                fetch delegate branches into refs/remotes/delegate/dlg/*
+  diff <slug> [git-diff-args]          diff base..impl for a task
+  log <slug>                           delegate commits for a task
+  squash <slug>                        stage the task's result on the current branch (git merge --squash)
+  clean <slug>                         delete the task's branches from the delegate
+  list                                 list delegate branches
+  watch [slug]                         live view of a task's turns (default: most recent task)
+EOF
+}
+
+sub=${1:-}; shift || true
+case "$sub" in
+  link|base|fetch|diff|log|squash|clean|list|watch) "cmd_$sub" "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

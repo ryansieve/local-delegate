@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# One command from a fresh Mac to a running delegate:
+# installs Ollama (Homebrew), configures it for agent work, pulls the model, then runs bin/setup-delegate.
+#   bin/bootstrap                     uses laguna-s-2.1:nvfp4 at 128K context
+#   MODEL=laguna-s-2.1:q4_K_M CTX=65536 bin/bootstrap
+# Ollama's settings reset on reboot; re-run this after a reboot (it skips the download).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+MODEL=${MODEL:-laguna-s-2.1:nvfp4}
+CTX=${CTX:-131072}
+API=http://127.0.0.1:11434
+
+say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
+die()  { printf '\033[31mxx  %s\033[0m\n' "$*" >&2; exit 1; }
+
+[[ "$(uname -s)" == "Darwin" ]] || die "run this on the Mac"
+
+# ---- Ollama app
+if [[ ! -d /Applications/Ollama.app ]]; then
+  command -v brew >/dev/null || die "Homebrew not found. Install Ollama from https://ollama.com/download, then re-run."
+  say "Installing Ollama"
+  brew install --cask ollama
+fi
+OLLAMA=$(command -v ollama || echo /Applications/Ollama.app/Contents/Resources/ollama)
+[[ -x "$OLLAMA" ]] || die "ollama CLI not found at $OLLAMA"
+
+# ---- server settings (read by the app at launch)
+say "Configuring Ollama: context=$CTX, keep model loaded, 20m load timeout"
+launchctl setenv OLLAMA_CONTEXT_LENGTH "$CTX"
+launchctl setenv OLLAMA_KEEP_ALIVE -1
+launchctl setenv OLLAMA_LOAD_TIMEOUT 20m
+
+say "Restarting Ollama"
+osascript -e 'quit app "Ollama"' >/dev/null 2>&1 || true
+sleep 3
+open -a Ollama
+for _ in $(seq 1 60); do curl -fsS --max-time 1 "$API/api/version" >/dev/null 2>&1 && break; sleep 1; done
+curl -fsS --max-time 2 "$API/api/version" >/dev/null || die "Ollama didn't come up on $API"
+echo "    Ollama $(curl -fsS "$API/api/version")"
+
+# ---- model
+if "$OLLAMA" list | awk '{print $1}' | grep -qxF "$MODEL"; then
+  say "$MODEL already pulled"
+else
+  say "Pulling $MODEL (large download; resumable if interrupted)"
+  "$OLLAMA" pull "$MODEL"
+fi
+
+say "Loading $MODEL (first load can take several minutes)"
+curl -fsS --max-time 1200 "$API/api/generate" -d "{\"model\":\"$MODEL\",\"prompt\":\"\",\"keep_alive\":-1}" >/dev/null \
+  || die "model failed to load — try a smaller context: CTX=65536 bin/bootstrap"
+
+# ---- point the daemon at it and finish setup
+[[ -f .env ]] || cp .env.example .env
+perl -i -pe "s#^MODEL_BASE_URL=.*#MODEL_BASE_URL=$API/v1#; s#^MODEL_NAME=.*#MODEL_NAME=$MODEL#" .env
+grep -q '^MODEL_CONTEXT_TOKENS=' .env && perl -i -pe "s#^MODEL_CONTEXT_TOKENS=.*#MODEL_CONTEXT_TOKENS=$CTX#" .env \
+  || printf 'MODEL_CONTEXT_TOKENS=%s\n' "$CTX" >> .env
+
+say "Running setup-delegate"
+exec bin/setup-delegate "$@"

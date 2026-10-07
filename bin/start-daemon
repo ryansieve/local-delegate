@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# launchd entrypoint: load the project .env and run the built daemon.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ENV_FILE="${DELEGATE_ENV_FILE:-$PWD/.env}"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE — run bin/setup-delegate" >&2; exit 1; }
+set -a; source "$ENV_FILE"; set +a
+# launchd's PATH is minimal; setup-delegate pins the toolchain PATH the agent's commands need.
+[[ -n "${DELEGATE_PATH:-}" ]] && export PATH="$DELEGATE_PATH"
+exec "${NODE_BIN:-node}" dist/index.js
