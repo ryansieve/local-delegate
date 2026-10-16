@@ -38,7 +38,7 @@ Never commit or push `.delegate/`. Don't push anything unless I ask.
 ## Phase 2: Tasks and routing
 Split the work into tasks, each one cohesive change. Route each task:
 
-**delegate**: well-specified, checkable by tests, and local. Examples: new modules behind a defined interface, adapters and mappers, validation, CRUD layers, pure functions, test-backed bug fixes, mechanical migrations or renames, boilerplate. **Size: one behavior, 1–3 files, under ~150 changed lines**, so it fits the default budget of 25 turns / 15 minutes. Prefer more small delegate tasks over fewer large ones; small tasks finish, large ones wander and get stopped.
+**delegate**: well-specified, checkable by tests, and local. Examples: new modules behind a defined interface, adapters and mappers, validation, CRUD layers, pure functions, test-backed bug fixes, mechanical migrations or renames, boilerplate. **Size: one behavior, 1–3 files, under ~150 changed lines**, so it fits the default budget of 25 turns / 15 minutes. Prefer more small delegate tasks over fewer large ones; small tasks finish, large ones wander and get stopped. Leave `think` at its default (`auto`) unless a task needs real reasoning the spec can't spell out; then mark it `think: on` in the task details.
 
 **claude**: anything that needs judgment. Examples: shared types and interfaces that other tasks depend on, cross-cutting refactors, Claude-only areas from the profile, ambiguous behavior, code where concurrency, security, or performance is critical, wiring between delegated pieces, final docs.
 
@@ -78,6 +78,7 @@ Assumptions (each flagged so I can correct it).
 - Tests to write: file path and cases
 - Verify: [install, typecheck, lint, scoped tests]
 - Protected: [test files, plus anything off-limits]
+- Think: auto (or `on`, with a one-line reason)
 
 ### t1: Define shared types and errors (claude)
 - Files, approach, done-when

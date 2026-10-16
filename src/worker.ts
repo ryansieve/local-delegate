@@ -1,10 +1,10 @@
 import { appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.js';
-import { changedPaths, commitAll, diffStat, prepareWorktree, removeWorktree, type Workspace } from './git.js';
+import { changedPaths, commitAll, diffStat, prepareWorktree, pruneStaleWorktrees, type Workspace } from './git.js';
 import { type Harness, HarnessError, type HarnessOutput } from './harness/types.js';
 import type { TaskStore } from './store.js';
-import type { FailureKind, Progress, Task, TaskResult } from './types.js';
+import { type FailureKind, type Progress, type Task, type TaskResult, thinkingFor } from './types.js';
 import { isProtected } from './verify.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -13,6 +13,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export class Worker {
   #current: { id: string; controller: AbortController; progress: Progress } | null = null;
   #stopped = false;
+  #lastPrune = 0;
 
   constructor(private readonly store: TaskStore, private readonly harness: Harness) {}
 
@@ -37,6 +38,7 @@ export class Worker {
 
   async #loop(): Promise<void> {
     while (!this.#stopped) {
+      await this.#pruneWorktrees();
       const task = this.store.claimNext();
       if (!task) { await sleep(2_000); continue; }
       await this.#process(task).catch((err: Error) => {
@@ -46,25 +48,39 @@ export class Worker {
     }
   }
 
+  /** Worktrees are kept between rounds (installed dependencies survive); stale ones are removed periodically. */
+  async #pruneWorktrees(): Promise<void> {
+    if (Date.now() - this.#lastPrune < 30_000) return;
+    this.#lastPrune = Date.now();
+    const removed = await pruneStaleWorktrees(this.#current?.id).catch((err: Error) => {
+      console.error('[worker] worktree cleanup failed:', err.message);
+      return [];
+    });
+    if (removed.length) console.log(`[worker] removed stale worktrees: ${removed.join(', ')}`);
+  }
+
   async #process(task: Task): Promise<void> {
     const controller = new AbortController();
     const started = Date.now();
     const progress: Progress = {
       startedAt: started, turn: 0, maxTurns: task.maxTurns, maxMinutes: task.maxMinutes,
       lastActivityAt: started, lastTool: null, filesChanged: [], promptTokens: 0, contextPct: 0,
-      outputTokens: 0, verifyAttempts: 0, nudges: 0,
+      outputTokens: 0, verifyAttempts: 0, nudges: 0, thinking: thinkingFor(task),
     };
     this.#current = { id: task.id, controller, progress };
     const logFile = join(config.logsDir, `${task.id}.jsonl`);
     const log = (event: Record<string, unknown>) =>
       appendFileSync(logFile, `${JSON.stringify({ ts: new Date().toISOString(), round: task.round, ...event })}\n`);
 
-    log({ type: 'start', harness: this.harness.name, model: config.model.name, maxTurns: task.maxTurns, maxMinutes: task.maxMinutes });
-    console.log(`[worker] ${task.id} round ${task.round} started (budget ${task.maxTurns} turns / ${task.maxMinutes} min)`);
+    log({ type: 'start', harness: this.harness.name, model: config.model.name, maxTurns: task.maxTurns, maxMinutes: task.maxMinutes, thinking: progress.thinking });
+    console.log(`[worker] ${task.id} round ${task.round} started (budget ${task.maxTurns} turns / ${task.maxMinutes} min, thinking ${progress.thinking ? 'on' : 'off'})`);
 
     let workspace: Workspace | undefined;
     try {
       workspace = await prepareWorktree(task);
+      log({ type: 'worktree', reused: workspace.reused });
+      // The harness's budget clock starts after checkout, not when the task was claimed.
+      progress.startedAt = progress.lastActivityAt = Date.now();
       this.store.update(task.id, { phase: 'implementing' });
 
       let output: HarnessOutput;
@@ -92,6 +108,8 @@ export class Worker {
       const result: TaskResult = {
         summary: output.summary,
         failure,
+        thinking: progress.thinking,
+        baseSha: workspace.baseSha,
         verification: output.verification,
         protectedViolations: violations,
         headSha,
@@ -106,7 +124,6 @@ export class Worker {
       log({ type: 'end', state: error ? 'failed' : 'succeeded', failure, error, headSha, usage: output.usage, turns: output.turns });
       console.log(`[worker] ${task.id} round ${task.round} ${error ? `failed (${failure}): ${error}` : 'succeeded'}`);
     } finally {
-      if (workspace) await removeWorktree(task.repo, workspace.dir);
       this.#current = null;
     }
   }

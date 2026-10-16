@@ -1,9 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { config } from './config.js';
-import { refExists, repoExists } from './git.js';
+import { createBranch, refExists, repoExists, resolveCommit } from './git.js';
 import type { TaskStore } from './store.js';
-import { isTerminal, refsFor, type RoundRecord, type Task } from './types.js';
+import { isTerminal, refsFor, type RoundRecord, type Task, THINK_MODES, thinkingFor } from './types.js';
 import type { Worker } from './worker.js';
 
 const NAME = /^[A-Za-z0-9._-]{1,100}$/;
@@ -18,7 +18,10 @@ const budgetSchema = {
   max_turns: z.number().int().min(3).max(200).optional()
     .describe(`Turn budget for this round (default ${config.agent.maxTurns}). Keep tasks small enough to fit.`),
   max_minutes: z.number().int().min(1).max(240).optional()
-    .describe(`Wall-clock budget for this round (default ${config.agent.maxMinutes}).`),
+    .describe(`Wall-clock budget for this round (default ${config.agent.maxMinutes}). Enforced mid-turn.`),
+  think: z.enum(THINK_MODES).optional()
+    .describe(`Model thinking (default ${config.agent.think}). auto = off for the first attempt, on for revisions. ` +
+      'Use "on" for tasks that need real reasoning (tricky algorithms, subtle invariants); "off" keeps small tasks fast.'),
 };
 
 /** Status plus, while running, a heartbeat Claude can use to tell "working" from "stuck". */
@@ -27,6 +30,7 @@ const status = (t: Task, worker: Worker) => {
   const now = Date.now();
   return {
     task_id: t.id, state: t.state, phase: t.phase, round: t.round, done: isTerminal(t.state),
+    ...(t.replayOf && { replay_of: t.replayOf }),
     failure: t.result?.failure ?? null, error: t.error, updated_at: t.updatedAt,
     ...(p && {
       progress: {
@@ -41,10 +45,13 @@ const status = (t: Task, worker: Worker) => {
         output_tokens: p.outputTokens,
         verify_attempts: p.verifyAttempts,
         stall_nudges: p.nudges,
+        thinking: p.thinking,
       },
     }),
   };
 };
+
+const budgetOf = (t: Task) => ({ max_turns: t.maxTurns, max_minutes: t.maxMinutes, think: t.think, thinking_next_round: thinkingFor(t) });
 
 const fetchHint = (t: Task) => ({
   diff: `dlg diff ${t.id}`,
@@ -66,7 +73,7 @@ const roundRecord = (t: Task): RoundRecord => ({
 
 /** Builds a fresh MCP server per request (stateless Streamable HTTP); state lives in the store. */
 export const buildMcpServer = (store: TaskStore, worker: Worker): McpServer => {
-  const server = new McpServer({ name: 'delegate', version: '0.2.0' });
+  const server = new McpServer({ name: 'delegate', version: '0.3.0' });
 
   server.registerTool('submit_task', {
     title: 'Submit task to local delegate',
@@ -82,7 +89,7 @@ export const buildMcpServer = (store: TaskStore, worker: Worker): McpServer => {
       protected_paths: z.array(z.string()).default([]).describe('Paths the delegate must not change. "dir/" protects a directory.'),
       ...budgetSchema,
     },
-  }, async ({ repo, slug, spec, verify, protected_paths, max_turns, max_minutes }) => {
+  }, async ({ repo, slug, spec, verify, protected_paths, max_turns, max_minutes, think }) => {
     if (!(await repoExists(repo))) return fail(`Unknown repo "${repo}". Run \`dlg link ${repo} delegate\` on the laptop first.`);
     if (store.get(slug)) return fail(`Task "${slug}" already exists. Use submit_revision to iterate, or pick a new slug.`);
     const refs = refsFor(slug);
@@ -90,9 +97,9 @@ export const buildMcpServer = (store: TaskStore, worker: Worker): McpServer => {
     const task = store.create({
       id: slug, repo, ...refs, spec, verify, protectedPaths: protected_paths,
       maxTurns: max_turns ?? config.agent.maxTurns, maxMinutes: max_minutes ?? config.agent.maxMinutes,
+      think: think ?? config.agent.think,
     });
-    return json({ ...status(task, worker), base_ref: task.baseRef, impl_ref: task.implRef,
-      budget: { max_turns: task.maxTurns, max_minutes: task.maxMinutes } });
+    return json({ ...status(task, worker), base_ref: task.baseRef, impl_ref: task.implRef, budget: budgetOf(task) });
   });
 
   server.registerTool('wait_for_task', {
@@ -125,8 +132,7 @@ export const buildMcpServer = (store: TaskStore, worker: Worker): McpServer => {
     const task = store.get(task_id);
     if (!task) return fail(`No task "${task_id}".`);
     return json({ ...status(task, worker), repo: task.repo, base_ref: task.baseRef, impl_ref: task.implRef,
-      budget: { max_turns: task.maxTurns, max_minutes: task.maxMinutes },
-      result: task.result, history: task.history, next: fetchHint(task) });
+      budget: budgetOf(task), result: task.result, history: task.history, next: fetchHint(task) });
   });
 
   server.registerTool('submit_revision', {
@@ -140,7 +146,7 @@ export const buildMcpServer = (store: TaskStore, worker: Worker): McpServer => {
       feedback: z.string().min(1).describe('Specific, actionable steering: files, current behavior, required behavior.'),
       ...budgetSchema,
     },
-  }, async ({ task_id, feedback, max_turns, max_minutes }) => {
+  }, async ({ task_id, feedback, max_turns, max_minutes, think }) => {
     const task = store.get(task_id);
     if (!task) return fail(`No task "${task_id}".`);
     if (!isTerminal(task.state)) return fail(`Task is ${task.state}; wait for it to finish (or cancel it) first.`);
@@ -149,8 +155,42 @@ export const buildMcpServer = (store: TaskStore, worker: Worker): McpServer => {
       history: [...task.history, roundRecord(task)], result: null, error: null,
       ...(max_turns !== undefined && { maxTurns: max_turns }),
       ...(max_minutes !== undefined && { maxMinutes: max_minutes }),
+      ...(think !== undefined && { think }),
     });
-    return json({ ...status(updated, worker), budget: { max_turns: updated.maxTurns, max_minutes: updated.maxMinutes } });
+    return json({ ...status(updated, worker), budget: budgetOf(updated) });
+  });
+
+  server.registerTool('replay_task', {
+    title: 'Replay a delegate task',
+    description:
+      'Re-run an earlier task\'s original spec from its original base under a new slug, with different settings ' +
+      '(think, budget), to compare model settings on identical work. Replays are experiments: compare them with ' +
+      'get_task_result, but never squash or land them. Works after `dlg clean` as long as the base commit still exists on the delegate.',
+    inputSchema: {
+      task_id: z.string().describe('The task to replay.'),
+      slug: z.string().regex(SLUG).optional().describe('New slug (default <task_id>-replay-<n>).'),
+      ...budgetSchema,
+    },
+  }, async ({ task_id, slug, max_turns, max_minutes, think }) => {
+    const source = store.get(task_id);
+    if (!source) return fail(`No task "${task_id}".`);
+    const baseSha = await resolveCommit(source.repo, source.baseRef)
+      ?? (source.result?.baseSha && await resolveCommit(source.repo, source.result.baseSha));
+    if (!baseSha) return fail(`Base of "${task_id}" is gone (branch deleted and no recorded commit). Re-push it with \`dlg base <new-slug>\` from that commit and use submit_task.`);
+    let id = slug;
+    for (let n = 1; !id; n++) {
+      const candidate = `${task_id}-replay-${n}`.slice(0, 64);
+      if (!store.get(candidate)) id = candidate;
+    }
+    if (store.get(id)) return fail(`Task "${id}" already exists; pick another slug.`);
+    const refs = refsFor(id);
+    await createBranch(source.repo, refs.baseRef, baseSha);
+    const task = store.create({
+      id, repo: source.repo, ...refs, spec: source.spec, verify: source.verify, protectedPaths: source.protectedPaths,
+      maxTurns: max_turns ?? source.maxTurns, maxMinutes: max_minutes ?? source.maxMinutes,
+      think: think ?? source.think, replayOf: source.id,
+    });
+    return json({ ...status(task, worker), base_sha: baseSha, budget: budgetOf(task) });
   });
 
   server.registerTool('cancel_task', {

@@ -46,6 +46,8 @@ export const config = Object.freeze({
     contextTokens: int('MODEL_CONTEXT_TOKENS', 131_072),
     /** Left unset by default so the server/model card default applies. */
     temperature: optionalNumber('MODEL_TEMPERATURE'),
+    /** reasoning_effort sent when thinking is on ("none" is sent when off). Ollama maps it per model. */
+    thinkEffort: str('MODEL_THINK_EFFORT', 'high'),
     requestTimeoutMs: int('MODEL_REQUEST_TIMEOUT_MS', 60 * 60_000),
   }),
 
@@ -64,6 +66,12 @@ export const config = Object.freeze({
     toolOutputChars: int('AGENT_TOOL_OUTPUT_CHARS', 6_000),
     verifyOutputChars: int('AGENT_VERIFY_OUTPUT_CHARS', 8_000),
     readFileLines: int('AGENT_READ_FILE_LINES', 200),
+    /** Default thinking mode: auto = off for the first attempt, on for revision rounds. */
+    think: str('AGENT_THINK', 'auto') as 'auto' | 'on' | 'off',
+    /** Worktrees (with installed dependencies) are kept between rounds and removed after this long unused. */
+    worktreeTtlMinutes: int('AGENT_WORKTREE_TTL_MINUTES', 48 * 60),
+    /** Sets npm_config_prefer_offline for agent and verify commands, so installs reuse the local package store. */
+    preferOffline: (process.env.AGENT_PREFER_OFFLINE ?? 'true') !== 'false',
   }),
 });
 

@@ -4,7 +4,7 @@ import { Agent, fetch } from 'undici';
 import { config } from '../config.js';
 import { git } from '../git.js';
 import { runShell } from '../shell.js';
-import type { FailureKind, Task, Usage, VerifyReport } from '../types.js';
+import { type FailureKind, type Task, thinkingFor, type Usage, type VerifyReport } from '../types.js';
 import { formatReport, isProtected, runVerify } from '../verify.js';
 import { type Harness, HarnessError, type HarnessInput, type HarnessOutput } from './types.js';
 
@@ -111,6 +111,8 @@ export class NativeHarness implements Harness {
     ];
     const usage: Usage = { promptTokens: 0, completionTokens: 0 };
     const deadline = progress.startedAt + task.maxMinutes * 60_000;
+    const thinking = thinkingFor(task);
+    progress.thinking = thinking;
     let verification: VerifyReport | null = null;
     let verifyAttempts = 0;
     let idleTurns = 0;
@@ -132,9 +134,11 @@ export class NativeHarness implements Harness {
       const started = Date.now();
       let response: ChatResponse;
       try {
-        response = await this.#chat(messages, signal);
+        response = await this.#chat(messages, signal, thinking, deadline);
       } catch (err) {
         if (signal.aborted) throw new HarnessError('cancelled', 'cancelled', partial(turn - 1));
+        // A single long thinking turn can outlast the budget; the request is cut off at the deadline.
+        if (Date.now() >= deadline - 1_000) stop(`budget exhausted: ${task.maxMinutes} minutes (stopped mid-turn)`, 'budget', turn - 1);
         throw new HarnessError(`model request failed: ${(err as Error).message}`, 'infra', partial(turn - 1));
       }
       const promptTokens = response.usage?.prompt_tokens ?? 0;
@@ -194,7 +198,7 @@ export class NativeHarness implements Harness {
           continue;
         }
 
-        const output = await this.#execute(name, args, task, dir, signal).catch((err: Error) => `Error: ${err.message}`);
+        const output = await this.#execute(name, args, task, dir, signal, deadline).catch((err: Error) => `Error: ${err.message}`);
         touch(name);
         if ((name === 'write_file' || name === 'edit_file') && !output.startsWith('Error')) {
           lastWriteTurn = turn;
@@ -232,10 +236,11 @@ export class NativeHarness implements Harness {
     return stop(`budget exhausted: ${task.maxTurns} turns`, 'budget', task.maxTurns);
   }
 
-  async #chat(messages: Message[], signal: AbortSignal): Promise<ChatResponse> {
-    const { baseUrl, name, apiKey, maxTokens, temperature, requestTimeoutMs } = config.model;
+  async #chat(messages: Message[], signal: AbortSignal, thinking: boolean, deadline: number): Promise<ChatResponse> {
+    const { baseUrl, name, apiKey, maxTokens, temperature, requestTimeoutMs, thinkEffort } = config.model;
     const body = JSON.stringify({
       model: name, messages, tools: TOOLS, tool_choice: 'auto', max_tokens: maxTokens,
+      reasoning_effort: thinking ? thinkEffort : 'none',
       ...(temperature === undefined ? {} : { temperature }),
     });
 
@@ -244,19 +249,19 @@ export class NativeHarness implements Harness {
         const res = await fetch(`${baseUrl}/chat/completions`, {
           method: 'POST', dispatcher, body,
           headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-          signal: AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)]),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(Math.max(1_000, Math.min(requestTimeoutMs, deadline - Date.now())))]),
         });
         if (res.ok) return (await res.json()) as ChatResponse;
         const text = await res.text();
         if (res.status < 500 || attempt >= 3) throw new Error(`HTTP ${res.status}: ${text.slice(0, 500)}`);
       } catch (err) {
-        if (signal.aborted || attempt >= 3) throw err;
+        if (signal.aborted || attempt >= 3 || Date.now() >= deadline - 1_000) throw err;
       }
       await sleep(5_000 * attempt);
     }
   }
 
-  async #execute(name: string, args: Record<string, unknown>, task: Task, dir: string, signal: AbortSignal): Promise<string> {
+  async #execute(name: string, args: Record<string, unknown>, task: Task, dir: string, signal: AbortSignal, deadline: number): Promise<string> {
     const inside = (p: unknown): string => {
       const abs = resolve(dir, String(p ?? '.'));
       if (abs !== dir && !abs.startsWith(dir + sep)) throw new Error(`path escapes the repo: ${String(p)}`);
@@ -309,7 +314,8 @@ export class NativeHarness implements Harness {
       }
       case 'run': {
         const timeoutMs = args.timeout_s ? Number(args.timeout_s) * 1_000 : config.agent.commandTimeoutMs;
-        const r = await runShell(String(args.command ?? ''), dir, Math.min(timeoutMs, config.agent.commandTimeoutMs), config.agent.toolOutputChars, signal);
+        const budgetLeft = Math.max(5_000, deadline - Date.now());
+        const r = await runShell(String(args.command ?? ''), dir, Math.min(timeoutMs, config.agent.commandTimeoutMs, budgetLeft), config.agent.toolOutputChars, signal);
         return `[exit ${r.timedOut ? 'timeout' : r.exitCode}, ${Math.round(r.durationMs / 1000)}s]\n${r.output}`;
       }
       default:

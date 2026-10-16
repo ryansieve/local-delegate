@@ -107,13 +107,20 @@ Claude works on its own tasks while delegate tasks run, polls the heartbeat, rev
 
 | MCP tool | |
 |---|---|
-| `submit_task(repo, slug, spec, verify[], protected_paths[], max_turns?, max_minutes?)` | Queue a task (defaults: 25 turns / 15 min) |
+| `submit_task(repo, slug, spec, verify[], protected_paths[], max_turns?, max_minutes?, think?)` | Queue a task (defaults: 25 turns / 15 min, think `auto`) |
 | `wait_for_task(task_id, timeout_s)` | Long-poll; `progress` heartbeat while running |
 | `get_task_result(task_id)` | Result, `failure` kind, verification output, diffstat, usage, round history |
-| `submit_revision(task_id, feedback, max_turns?, max_minutes?)` | Continue on the same branch (after review, failure, or cancel) |
+| `submit_revision(task_id, feedback, max_turns?, max_minutes?, think?)` | Continue on the same branch (after review, failure, or cancel) |
+| `replay_task(task_id, slug?, think?, max_turns?, max_minutes?)` | Re-run a past task's spec from its original base with other settings, for comparison only |
 | `cancel_task` / `list_tasks` | |
 
 Failure kinds: `verification`, `protected`, `budget`, `context`, `stalled`, `infra`, `cancelled`. Budget, context, and stall failures mean the task needs to be narrowed or split, not taken over.
+
+**Thinking.** `think` is `auto` by default: thinking is off for a task's first attempt and on for revision rounds. Long thinking is the most common reason tasks run slow or out of time, and small, well-specified tasks rarely need it. Use `think: "on"` for tasks that need real reasoning the spec can't spell out.
+
+**Budgets.** The time budget is enforced mid-turn: a long model response is cut off at the deadline, and shell commands are capped at the time remaining.
+
+**Worktrees.** A task's worktree, including installed dependencies and build output, is kept between rounds, so revisions skip the reinstall. Worktrees unused for 48 hours are removed automatically. Installs run with `npm_config_prefer_offline=true`, so they reuse the machine's package cache.
 
 ## Keeping the team's GitHub clean
 
@@ -122,6 +129,19 @@ Failure kinds: `verification`, `protected`, `budget`, `context`, `stalled`, `inf
 - **Your history stays clean.** `dlg squash` stages changes for you to commit in your own words, so the delegate's per-round commits never reach your branch.
 - **A push guard backs this up.** The local `pre-push` hook refuses to push `dlg/*` refs anywhere but `delegate`.
 - **Nothing lands in team config.** MCP registration and commands are user-scoped, so nothing is added to a repo's `.mcp.json` or `.claude/`.
+
+## Health check
+
+From the laptop, in order:
+
+```bash
+ping -c 2 <delegate-ip>                                   # fails: delegate asleep, off the network, or new IP
+ssh -o ConnectTimeout=5 delegate true && echo ssh-ok      # fails: Remote Login off, or key issue
+curl -sS --max-time 5 http://127.0.0.1:7420/healthz       # fails: tunnel or daemon down
+ssh delegate 'curl -s localhost:7420/healthz; echo; ollama ps; tail -5 ~/delegate/daemon.log'
+```
+
+Restart the daemon: `ssh delegate 'launchctl kickstart -k gui/$(id -u)/local.delegate.daemon'`. Restart the tunnel: `launchctl kickstart -k gui/$(id -u)/local.delegate.tunnel`. If the delegate's IP changed, re-run `bin/setup-laptop <new-ip> <user>`.
 
 ## Monitoring
 
@@ -137,6 +157,7 @@ Per-task results (SQLite on the delegate):
 ssh delegate 'sqlite3 -header -column ~/delegate/delegate.db' <<'SQL'
 select id, state, round,
   json_extract(result_json,'$.failure') as failure,
+  json_extract(result_json,'$.thinking') as think,
   json_extract(result_json,'$.turns') as turns,
   json_extract(result_json,'$.usage.promptTokens') as prompt_tok,
   json_extract(result_json,'$.usage.completionTokens') as out_tok,
@@ -146,6 +167,13 @@ SQL
 ```
 
 `prompt_tok` sums the full prompt re-sent each turn, so it's a context-bloat signal rather than a measure of work. `out_tok` is the real generation work.
+
+Reading the patterns:
+- **Overthinking:** high `out_tok` per turn, few turns, many minutes.
+- **Wandering:** many turns with small `out_tok` (task too big, or spec missing code context).
+- **Slow commands:** many minutes but low `out_tok`.
+
+**Comparing settings.** Ask Claude to `replay_task` past tasks with a different `think` or budget, then compare pass rate, minutes, and turns with the originals. Replays run on the delegate only and are never landed.
 
 **In an IDE database tool:** `dlg-db` copies a consistent read-only snapshot to `~/delegate-db/delegate.db`. Point an SQLite data source at that file, mark it read-only, and reconnect to refresh. To refresh every minute, run it from a launchd agent with `StartInterval` 60.
 
@@ -162,7 +190,11 @@ Per-turn logs live on the delegate at `~/delegate/logs/<slug>.jsonl`.
 | `AGENT_STALL_TURNS` / `AGENT_MAX_NUDGES` | `10` / `2` | Stall detection |
 | `AGENT_CONTEXT_WARN` / `AGENT_CONTEXT_STOP` | `0.6` / `0.85` | Context guard |
 | `AGENT_TOOL_OUTPUT_CHARS` / `AGENT_READ_FILE_LINES` | `6000` / `200` | Keeps context lean |
-| `AGENT_COMMAND_TIMEOUT_MS` | `600000` | Per shell command |
+| `AGENT_COMMAND_TIMEOUT_MS` | `600000` | Per shell command (also capped by the time budget) |
+| `AGENT_THINK` | `auto` | Default thinking mode: `auto` (off first attempt, on for revisions), `on`, `off` |
+| `MODEL_THINK_EFFORT` | `high` | `reasoning_effort` sent when thinking is on (`none` is sent when off) |
+| `AGENT_WORKTREE_TTL_MINUTES` | `2880` | Unused worktrees are removed after this long |
+| `AGENT_PREFER_OFFLINE` | `true` | Sets `npm_config_prefer_offline` for agent and verify commands |
 | `CARGO_TARGET_DIR` | unset | Set for Rust repos so rounds share a build cache |
 
 After editing, restart the daemon: `launchctl kickstart -k gui/$(id -u)/local.delegate.daemon`.
@@ -183,7 +215,9 @@ After editing, restart the daemon: `launchctl kickstart -k gui/$(id -u)/local.de
 | `ssh-copy-id`: `Permission denied (publickey)` | Password logins are already disabled. Remove `/etc/ssh/sshd_config.d/100-keys-only.conf` on the delegate, copy the key, then put the file back. |
 | zsh: `parse error near ')'` when pasting commands | zsh doesn't treat `#` as a comment interactively. Paste without comments, or `setopt interactivecomments`. |
 | Tasks fail with `budget` / `stalled` / `context` | The task is too big or the spec too vague. Split it, and put the relevant code inline in the spec. |
-| Tasks fail on missing dependencies | Each round runs in a fresh checkout. Verify must start with the install step (`pnpm install --frozen-lockfile`, …). |
+| Tasks fail on missing dependencies | A task's first round runs in a fresh checkout. Verify must start with the install step (`pnpm install --frozen-lockfile`, …); later rounds reuse the installed dependencies. |
+| Tasks run long with few turns | Thinking is on. Leave `think` at `auto`, or use `off` for small tasks. |
+| A query over SSH times out | The delegate is unreachable; see Health check. |
 | `/delegate` appears twice (user + project) | A stale copy is in the repo's `.claude/commands/`. Delete it; the user copy is the current one. |
 
 ## Security notes
