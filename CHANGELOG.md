@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0: thinking control, real time budgets, faster rounds
+
+- **Thinking control.** `think` on `submit_task`, `submit_revision`, and `replay_task` (`auto` | `on` | `off`, default `auto`): off for a task's first attempt, on for revisions. Sent as `reasoning_effort` (`none` when off). Results and the heartbeat report whether thinking was on.
+- **Time budget enforced mid-turn.** The model request is cut off at the deadline (`failure: "budget"`, "stopped mid-turn"), and shell commands are capped at the time remaining. Previously a single long thinking turn could run far past the budget.
+- **Worktrees kept between rounds**, so revisions reuse installed dependencies and build output. Stale worktrees are removed after 48 hours. Installs default to `npm_config_prefer_offline=true`.
+- **`replay_task`** re-runs a past task's spec from its original base under a new slug with different settings, for side-by-side comparison. It still works after `dlg clean` (results record `baseSha`).
+- **`/delegate` refuses whole tickets** and points to `/plan-work`. Both commands now include thinking guidance.
+- README: health-check section, failure patterns, new settings.
+
 ## 0.2.0: heartbeat and budgets
 
 **Daemon**

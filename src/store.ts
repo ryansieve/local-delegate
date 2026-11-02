@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { config } from './config.js';
-import type { RoundRecord, Task, TaskPhase, TaskResult, TaskState } from './types.js';
+import type { RoundRecord, Task, TaskPhase, TaskResult, TaskState, ThinkMode } from './types.js';
 
 interface Row {
   id: string;
@@ -12,6 +12,8 @@ interface Row {
   protected_json: string;
   max_turns: number | null;
   max_minutes: number | null;
+  think: ThinkMode | null;
+  replay_of: string | null;
   state: TaskState;
   phase: TaskPhase | null;
   round: number;
@@ -33,6 +35,8 @@ const toTask = (row: Row): Task => ({
   protectedPaths: JSON.parse(row.protected_json) as string[],
   maxTurns: row.max_turns ?? config.agent.maxTurns,
   maxMinutes: row.max_minutes ?? config.agent.maxMinutes,
+  think: row.think ?? config.agent.think,
+  replayOf: row.replay_of,
   state: row.state,
   phase: row.phase,
   round: row.round,
@@ -44,9 +48,10 @@ const toTask = (row: Row): Task => ({
   updatedAt: row.updated_at,
 });
 
-export type NewTask = Pick<Task, 'id' | 'repo' | 'baseRef' | 'implRef' | 'spec' | 'verify' | 'protectedPaths' | 'maxTurns' | 'maxMinutes'>;
+export type NewTask = Pick<Task, 'id' | 'repo' | 'baseRef' | 'implRef' | 'spec' | 'verify' | 'protectedPaths' | 'maxTurns' | 'maxMinutes' | 'think'>
+  & Partial<Pick<Task, 'replayOf'>>;
 export type TaskPatch = Partial<Pick<Task,
-  'state' | 'phase' | 'round' | 'feedback' | 'history' | 'result' | 'error' | 'maxTurns' | 'maxMinutes'>>;
+  'state' | 'phase' | 'round' | 'feedback' | 'history' | 'result' | 'error' | 'maxTurns' | 'maxMinutes' | 'think'>>;
 
 const now = () => new Date().toISOString();
 
@@ -86,17 +91,20 @@ export class TaskStore {
     add('max_turns', 'max_turns INTEGER');
     add('max_minutes', 'max_minutes INTEGER');
     add('history_json', 'history_json TEXT');
+    add('think', 'think TEXT');
+    add('replay_of', 'replay_of TEXT');
   }
 
   create(task: NewTask): Task {
     const ts = now();
     this.#db
       .prepare(
-        `INSERT INTO tasks (id, repo, base_ref, impl_ref, spec, verify_json, protected_json, max_turns, max_minutes, state, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+        `INSERT INTO tasks (id, repo, base_ref, impl_ref, spec, verify_json, protected_json, max_turns, max_minutes, think, replay_of, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
       )
       .run(task.id, task.repo, task.baseRef, task.implRef, task.spec,
-        JSON.stringify(task.verify), JSON.stringify(task.protectedPaths), task.maxTurns, task.maxMinutes, ts, ts);
+        JSON.stringify(task.verify), JSON.stringify(task.protectedPaths), task.maxTurns, task.maxMinutes,
+        task.think, task.replayOf ?? null, ts, ts);
     return this.get(task.id)!;
   }
 
@@ -134,6 +142,7 @@ export class TaskStore {
     if (patch.round !== undefined) set('round', patch.round);
     if (patch.maxTurns !== undefined) set('max_turns', patch.maxTurns);
     if (patch.maxMinutes !== undefined) set('max_minutes', patch.maxMinutes);
+    if (patch.think !== undefined) set('think', patch.think);
     if (patch.feedback !== undefined) set('feedback_json', JSON.stringify(patch.feedback));
     if (patch.history !== undefined) set('history_json', JSON.stringify(patch.history));
     if (patch.result !== undefined) set('result_json', patch.result && JSON.stringify(patch.result));

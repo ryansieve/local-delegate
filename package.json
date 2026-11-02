@@ -1,6 +1,6 @@
 {
   "name": "delegate-daemon",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local delegate: queues spec-driven coding tasks for a local model and returns verified git branches",
   "scripts": {
     "build": "tsc",

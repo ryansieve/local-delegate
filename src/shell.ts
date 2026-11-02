@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { config } from './config.js';
 
 /** Secrets the agent's commands should never see. */
 const SCRUBBED_ENV = ['DELEGATE_TOKEN', 'MODEL_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'GIT_ASKPASS', 'SSH_AUTH_SOCK'];
@@ -6,6 +7,7 @@ const SCRUBBED_ENV = ['DELEGATE_TOKEN', 'MODEL_API_KEY', 'GH_TOKEN', 'GITHUB_TOK
 const childEnv = (): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = { ...process.env, CI: '1', GIT_TERMINAL_PROMPT: '0', FORCE_COLOR: '0', NO_COLOR: '1' };
   for (const key of SCRUBBED_ENV) delete env[key];
+  if (config.agent.preferOffline) env.npm_config_prefer_offline ??= 'true';
   return env;
 };
 

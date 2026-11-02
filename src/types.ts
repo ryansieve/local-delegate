@@ -2,6 +2,8 @@ export const TERMINAL_STATES = ['succeeded', 'failed', 'cancelled'] as const;
 
 export type TaskState = 'queued' | 'running' | (typeof TERMINAL_STATES)[number];
 export type TaskPhase = 'preparing' | 'implementing' | 'finalizing';
+export type ThinkMode = 'auto' | 'on' | 'off';
+export const THINK_MODES = ['auto', 'on', 'off'] as const;
 
 /** Why a run ended without success — tells the reviewer whether to revise, split, or retry. */
 export type FailureKind =
@@ -35,6 +37,10 @@ export interface Usage {
 export interface TaskResult {
   summary: string;
   failure: FailureKind | null;
+  /** Whether model thinking was on for this round. */
+  thinking: boolean;
+  /** Base commit of the round's worktree; lets replay_task recreate the base after `dlg clean`. */
+  baseSha: string;
   verification: VerifyReport | null;
   protectedViolations: string[];
   headSha: string;
@@ -72,6 +78,7 @@ export interface Progress {
   outputTokens: number;
   verifyAttempts: number;
   nudges: number;
+  thinking: boolean;
 }
 
 export interface Task {
@@ -84,6 +91,9 @@ export interface Task {
   protectedPaths: string[];
   maxTurns: number;
   maxMinutes: number;
+  think: ThinkMode;
+  /** Set on replays: the task whose spec this one re-runs. */
+  replayOf: string | null;
   state: TaskState;
   phase: TaskPhase | null;
   round: number;
@@ -94,6 +104,10 @@ export interface Task {
   createdAt: string;
   updatedAt: string;
 }
+
+/** auto = off for the first attempt (small, well-specified tasks rarely need it), on for revisions. */
+export const thinkingFor = (task: Pick<Task, 'think' | 'round'>): boolean =>
+  task.think === 'on' || (task.think === 'auto' && task.round > 0);
 
 export const isTerminal = (state: TaskState): boolean =>
   (TERMINAL_STATES as readonly string[]).includes(state);
